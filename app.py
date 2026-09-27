@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, abort, render_template, request, redirect, url_for, session, flash, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -95,6 +95,175 @@ REACTION_EMOJIS = {
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
 
+# Claim 13: give every logged-in member one concrete, system-suggested goal.
+# Five posts/comments is intentionally measurable and challenging but still
+# achievable during one week.
+WEEKLY_GOAL_TARGET = 5
+
+
+def get_weekly_goal(user_id):
+    """Return a measurable system-suggested weekly contribution goal.
+
+    The goal runs from Monday through Sunday. Posts and comments have
+    timestamps in the supplied database, so they are used for the weekly
+    goal. Reactions are intentionally excluded because the existing reactions
+    table does not record when a reaction was made.
+    """
+    if not user_id:
+        return None
+
+    # SQLite's %w returns Sunday as 0; the expression below converts it into
+    # a Monday-based offset so the goal period is always Monday through Sunday.
+    activity = query_db('''
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT id FROM posts
+            WHERE user_id = ? AND created_at >= date('now', '-' || ((CAST(strftime('%w', 'now') AS INTEGER) + 6) % 7) || ' days')
+            UNION ALL
+            SELECT id FROM comments
+            WHERE user_id = ? AND created_at >= date('now', '-' || ((CAST(strftime('%w', 'now') AS INTEGER) + 6) % 7) || ' days')
+        ) weekly_activity
+    ''', (user_id, user_id), one=True)
+    current_count = activity['count'] if activity else 0
+
+    comparison = query_db('''
+        SELECT
+            COALESCE(AVG(member_count), 0) AS average_count,
+            COALESCE(MAX(member_count), 0) AS highest_count
+        FROM (
+            SELECT user_id, COUNT(*) AS member_count
+            FROM (
+                SELECT user_id FROM posts
+                WHERE created_at >= date('now', '-' || ((CAST(strftime('%w', 'now') AS INTEGER) + 6) % 7) || ' days')
+                UNION ALL
+                SELECT user_id FROM comments
+                WHERE created_at >= date('now', '-' || ((CAST(strftime('%w', 'now') AS INTEGER) + 6) % 7) || ' days')
+            ) recent_activity
+            GROUP BY user_id
+        ) member_activity
+    ''', one=True)
+
+    # Cap the display at 100% while retaining the real count for completion
+    # and feedback calculations.
+    percentage = min(100, round(current_count / WEEKLY_GOAL_TARGET * 100))
+    # datetime.weekday() returns Monday=0 and Sunday=6, so Sunday has zero
+    # days remaining and can be presented as "today" in the interface.
+    days_left = 6 - datetime.utcnow().weekday()
+    goal = {
+        'title': 'Weekly community contribution goal',
+        'description': f'Make {WEEKLY_GOAL_TARGET} posts or comments by the end of this week.',
+        'target': WEEKLY_GOAL_TARGET,
+        'current': current_count,
+        'remaining': max(0, WEEKLY_GOAL_TARGET - current_count),
+        'percentage': percentage,
+        'completed': current_count >= WEEKLY_GOAL_TARGET,
+        'days_left': days_left,
+        'days_label': 'today' if days_left == 0 else f'{days_left} days left',
+        'average': round(comparison['average_count'], 1) if comparison else 0,
+        'highest': comparison['highest_count'] if comparison else 0,
+    }
+    goal['feedback'] = get_goal_feedback(goal)
+    return goal
+
+
+def get_goal_feedback(goal):
+    """Create timely, performance-based feedback for a weekly goal."""
+    # Feedback changes as the member progresses, making Claim 15 observable
+    # instead of showing the same generic encouragement every time.
+    time_message = 'The deadline is today.' if goal['days_left'] == 0 else f"You have {goal['days_left']} days left."
+    if goal['completed']:
+        return f'Goal completed—thank you for contributing to the community! {time_message}'
+    if goal['current'] == 0:
+        return f'You have not started this goal yet. Your first contribution gets you moving. {time_message}'
+    if goal['remaining'] == 1:
+        return f'You are one contribution away from completing this goal! {time_message}'
+    if goal['current'] < goal['average']:
+        return f"You are at {goal['percentage']}%. Keep contributing to catch up with the community average. {time_message}"
+    return f"You are at {goal['percentage']}%. Keep going—you have made good progress. {time_message}"
+
+
+def get_community_social_proof():
+    """Return recent, database-backed participation for the feed summary.
+
+    The summary supports Claim 12 by showing that other members have already
+    contributed. The existing reactions table has no timestamp, so this uses
+    the complete activity currently represented in the supplied database.
+    """
+    # Count actions separately for total participation, but use UNION below
+    # when counting members so one member is not counted more than once.
+    activity_count = query_db('''
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT user_id FROM posts
+            UNION ALL
+            SELECT user_id FROM comments
+            UNION ALL
+            SELECT user_id FROM reactions
+        ) recent_activity
+    ''', one=True)
+
+    member_count = query_db('''
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT user_id FROM posts
+            UNION
+            SELECT user_id FROM comments
+            UNION
+            SELECT user_id FROM reactions
+        ) recent_members
+    ''', one=True)
+
+    top_contributors = query_db('''
+        SELECT u.username, COUNT(*) AS contribution_count
+        FROM (
+            SELECT user_id FROM posts
+            UNION ALL
+            SELECT user_id FROM comments
+            UNION ALL
+            SELECT user_id FROM reactions
+        ) recent_activity
+        JOIN users u ON u.id = recent_activity.user_id
+        GROUP BY recent_activity.user_id, u.username
+        ORDER BY contribution_count DESC, u.username ASC
+        LIMIT 3
+    ''')
+
+    return {
+        'active_members': member_count['count'] if member_count else 0,
+        'contributions': activity_count['count'] if activity_count else 0,
+        'top_contributors': top_contributors or [],
+    }
+
+
+def get_post_social_proof(post_id):
+    """Return distinct member participation for one post.
+
+    A member is counted once even if they both comment and react. This avoids
+    inflating the social-proof number while still exposing total actions.
+    """
+    proof = query_db('''
+        SELECT
+            (
+                SELECT COUNT(*)
+                FROM (
+                    SELECT user_id FROM comments WHERE post_id = ?
+                    UNION
+                    SELECT user_id FROM reactions WHERE post_id = ?
+                ) contributors
+            ) AS contributor_count,
+            (
+                SELECT COUNT(*) FROM comments WHERE post_id = ?
+            ) + (
+                SELECT COUNT(*) FROM reactions WHERE post_id = ?
+            ) AS contribution_count
+    ''', (post_id, post_id, post_id, post_id), one=True)
+
+    return {
+        'contributors': proof['contributor_count'] if proof else 0,
+        'contributions': proof['contribution_count'] if proof else 0,
+    }
+
+
 @app.route('/')
 def feed():
     #  1. Get Pagination and Filter Parameters 
@@ -176,6 +345,9 @@ def feed():
 
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
         comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
+        # Claim 12 uses distinct contributors for social proof, while the
+        # existing reaction/comment totals remain available separately.
+        social_proof = get_post_social_proof(post['id'])
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
         comments_moderated = []
@@ -188,7 +360,8 @@ def feed():
             'reactions': reactions,
             'user_reaction': user_reaction,
             'followed_poster': followed_poster,
-            'comments': comments_moderated
+            'comments': comments_moderated,
+            'social_proof': social_proof
         })
 
     #  4. Render Template with Pagination Info 
@@ -199,7 +372,8 @@ def feed():
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           community_social_proof=get_community_social_proof())
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -223,7 +397,10 @@ def add_post():
         db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
                    (user_id, moderated_content))
         db.commit()
-        flash('Your post was successfully created!', 'success')
+        # Refresh the goal immediately so the success message gives current
+        # Claim 15 feedback after the contribution is recorded.
+        goal = get_weekly_goal(user_id)
+        flash(f"Your post was successfully created! {goal['feedback']}", 'success')
     else:
         # This will catch empty posts or posts that were fully censored
         flash('Post cannot be empty or was fully censored.', 'warning')
@@ -320,7 +497,9 @@ def user_profile(username):
                            comments=comments,
                            followers_count=followers_count, 
                            following_count=following_count,
-                           is_following=is_currently_following)
+                           is_following=is_currently_following,
+                           weekly_goal=(get_weekly_goal(current_user_id)
+                                        if current_user_id == user['id'] else None))
     
 
 @app.route('/u/<username>/followers')
@@ -498,7 +677,9 @@ def add_comment(post_id):
         db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
                    (post_id, user_id, content))
         db.commit()
-        flash('Your comment was added.', 'success')
+        # Comments count toward the same weekly goal as posts.
+        goal = get_weekly_goal(user_id)
+        flash(f"Your comment was added. {goal['feedback']}", 'success')
     else:
         flash('Comment cannot be empty.', 'warning')
 
