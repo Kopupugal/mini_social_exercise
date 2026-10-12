@@ -79,6 +79,10 @@
       <p class="small text-muted mb-0">
         Other active members average {{ weekly_goal.average }} posts or comments this week.
       </p>
+      <p class="small text-success mb-0 mt-2">
+        Positive contribution score: <strong>{{ positive_contribution_score }}</strong>
+        — norm-following posts and comments.
+      </p>
       {# This message is calculated from current activity, not static encouragement. #}
       <div class="alert alert-info mt-3 mb-0 py-2" role="status">
         <strong>Performance feedback:</strong> {{ weekly_goal.feedback }}

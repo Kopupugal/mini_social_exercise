@@ -1,4 +1,4 @@
-from flask import Flask, abort, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, abort, jsonify, render_template, request, redirect, url_for, session, flash, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -133,6 +133,24 @@ def analyze_post_quality(content):
         'has_mention': has_mention,
         'has_hashtag': has_hashtag,
     }
+
+
+def get_positive_contribution_score(user_id):
+    """Count a user's posts and comments that follow the content norm.
+
+    This is intentionally separate from moderation risk and the weekly goal:
+    it gives contributors understandable positive feedback without changing
+    the existing risk calculations or goal progress rules.
+    """
+    if not user_id:
+        return 0
+
+    messages = query_db('''
+        SELECT content FROM posts WHERE user_id = ?
+        UNION ALL
+        SELECT content FROM comments WHERE user_id = ?
+    ''', (user_id, user_id)) or []
+    return sum(1 for message in messages if moderate_content(message['content'])[1] < 1.0)
 
 
 def get_weekly_goal(user_id):
@@ -298,6 +316,84 @@ def get_post_social_proof(post_id):
     }
 
 
+def get_community_norm_statistics():
+    """Calculate prevalence statistics for content that follows community norms.
+
+    A message is considered norm-following when its moderation score is below
+    1.0. Posts and comments are analyzed together so the statistics represent
+    the community's visible message behavior rather than only one content type.
+    """
+    messages = query_db('''
+        SELECT p.id, 'post' AS message_type, p.content, p.created_at, u.username
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        UNION ALL
+        SELECT c.id, 'comment' AS message_type, c.content, c.created_at, u.username
+        FROM comments c
+        JOIN users u ON u.id = c.user_id
+        ORDER BY 4 DESC
+    ''') or []
+
+    scored_messages = []
+    for message in messages:
+        moderated_content, score = moderate_content(message['content'])
+        scored_messages.append({
+            'content': moderated_content,
+            'score': score,
+            'message_type': message['message_type'],
+            'created_at': message['created_at'],
+            'username': message['username'],
+        })
+
+    total_messages = len(scored_messages)
+    compliant_messages = [message for message in scored_messages if message['score'] < 1.0]
+    flagged_messages = total_messages - len(compliant_messages)
+    compliance_percentage = (
+        round(len(compliant_messages) / total_messages * 100, 1)
+        if total_messages else 0.0
+    )
+
+    latest_flag_index = next(
+        (index for index, message in enumerate(scored_messages) if message['score'] >= 1.0),
+        None
+    )
+    messages_since_last_flag = (
+        latest_flag_index
+        if latest_flag_index is not None
+        else total_messages
+    )
+
+    return {
+        'total_messages': total_messages,
+        'compliant_messages': len(compliant_messages),
+        'flagged_messages': flagged_messages,
+        'compliance_percentage': compliance_percentage,
+        'messages_since_last_flag': messages_since_last_flag,
+        'examples': compliant_messages[:3],
+    }
+
+
+@app.route('/norm-check', methods=['POST'])
+def norm_check():
+    """Return live moderation feedback for the member's current draft."""
+    if not session.get('user_id'):
+        return jsonify({'error': 'Login required.'}), 401
+
+    payload = request.get_json(silent=True) or request.form
+    content = payload.get('content', '')
+    _, score = moderate_content(content)
+    follows_norm = score < 1.0
+    return jsonify({
+        'score': score,
+        'follows_norm': follows_norm,
+        'message': (
+            'This draft follows the community content norm.'
+            if follows_norm else
+            'This draft may not follow the community content norm. Revise it before posting.'
+        ),
+    })
+
+
 @app.route('/')
 def feed():
     #  1. Get Pagination and Filter Parameters 
@@ -408,6 +504,7 @@ def feed():
                            reaction_emojis=REACTION_EMOJIS,
                            reaction_types=REACTION_TYPES,
                            community_social_proof=get_community_social_proof(),
+                           community_norms=get_community_norm_statistics(),
                            post_draft=session.get('post_draft', ''),
                            min_post_length=MIN_POST_LENGTH,
                            min_post_words=MIN_POST_WORDS)
@@ -447,10 +544,25 @@ def add_post():
                    (user_id, moderated_content))
         db.commit()
         session.pop('post_draft', None)
+        _, post_score = moderate_content(moderated_content)
+        positive_score = get_positive_contribution_score(user_id)
         # Refresh the goal immediately so the success message gives current
         # Claim 15 feedback after the contribution is recorded.
         goal = get_weekly_goal(user_id)
-        flash(f"Your post was successfully created! {goal['feedback']}", 'success')
+        if post_score < 1.0:
+            contribution_feedback = (
+                f'Your positive contribution score increased to {positive_score}.'
+            )
+        else:
+            contribution_feedback = (
+                f'Your positive contribution score stays at {positive_score}; '
+                'revise the moderation issues to increase it.'
+            )
+        flash(
+            f"Your post was successfully created! {contribution_feedback} "
+            f"{goal['feedback']}",
+            'success'
+        )
     else:
         # This will catch empty posts or posts that were fully censored
         flash('Post cannot be empty or was fully censored.', 'warning')
@@ -549,7 +661,11 @@ def user_profile(username):
                            following_count=following_count,
                            is_following=is_currently_following,
                            weekly_goal=(get_weekly_goal(current_user_id)
-                                        if current_user_id == user['id'] else None))
+                                        if current_user_id == user['id'] else None),
+                           positive_contribution_score=(
+                               get_positive_contribution_score(user['id'])
+                               if current_user_id == user['id'] else None
+                           ))
     
 
 @app.route('/u/<username>/followers')

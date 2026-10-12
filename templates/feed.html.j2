@@ -16,6 +16,7 @@
         <div class="mb-3">
           <textarea class="form-control" name="content" id="new-post-content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required>{{ post_draft }}</textarea>
           <div id="post-quality-feedback" class="small mt-2" aria-live="polite"></div>
+          <div id="post-norm-feedback" class="small mt-2" aria-live="polite"></div>
         </div>
         <button type="submit" class="btn btn-primary float-end" id="submit-post-button">Post</button>
       </form>
@@ -30,6 +31,7 @@
     const form = document.getElementById('new-post-form');
     const textarea = document.getElementById('new-post-content');
     const feedback = document.getElementById('post-quality-feedback');
+    const normFeedback = document.getElementById('post-norm-feedback');
     const minimumLength = {{ min_post_length }};
     const minimumWords = {{ min_post_words }};
 
@@ -75,7 +77,36 @@
       return issues;
     }
 
-    textarea.addEventListener('input', updateFeedback);
+    let normRequestNumber = 0;
+    async function updateNormFeedback(value) {
+      if (!value.trim()) {
+        normFeedback.textContent = '';
+        return;
+      }
+
+      const requestNumber = ++normRequestNumber;
+      try {
+        const response = await fetch('{{ url_for('norm_check') }}', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({content: value})
+        });
+        const result = await response.json();
+        if (requestNumber !== normRequestNumber) return;
+        normFeedback.textContent = result.message;
+        normFeedback.className = result.follows_norm
+          ? 'small mt-2 text-success'
+          : 'small mt-2 text-danger';
+      } catch (error) {
+        normFeedback.textContent = 'Norm check is temporarily unavailable; you can still revise the draft using the checklist above.';
+        normFeedback.className = 'small mt-2 text-muted';
+      }
+    }
+
+    textarea.addEventListener('input', () => {
+      updateFeedback();
+      updateNormFeedback(textarea.value);
+    });
     form.addEventListener('submit', (event) => {
       if (updateFeedback().length) {
         event.preventDefault();
@@ -83,6 +114,7 @@
       }
     });
     updateFeedback();
+    updateNormFeedback(textarea.value);
   })();
 </script>
 {% endif %}
@@ -111,6 +143,31 @@
     {% else %}
       <p class="mb-0">No recent contributions yet. Start the conversation with a post or comment.</p>
     {% endif %}
+  </div>
+</div>
+
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h5 class="card-title">Community norms</h5>
+      {% if community_norms.total_messages %}
+        <p class="mb-2">
+          <strong>{{ community_norms.compliance_percentage }}%</strong> of the community's posts and comments follow the content norms.
+          <strong>{{ community_norms.messages_since_last_flag }}</strong> messages have appeared since the last flagged message.
+        </p>
+        <details>
+          <summary class="text-primary" role="button">See examples of norm-following messages</summary>
+          <ul class="small mt-2 mb-0">
+            {% for example in community_norms.examples %}
+              <li class="mb-1">{{ example.content|truncate(140, True, '...') }} <span class="text-muted">— @{{ example.username }}</span></li>
+            {% endfor %}
+          </ul>
+        </details>
+      {% else %}
+        <p class="mb-0">No messages have been analyzed yet. Be the first to contribute constructively.</p>
+      {% endif %}
+      <a class="btn btn-sm btn-light mt-3" href="{{ url_for('rules') }}">Review the community rules</a>
+    </div>
   </div>
 </div>
 
