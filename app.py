@@ -6,6 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
+import secrets
 from datetime import datetime
 
 app = Flask(__name__)
@@ -436,7 +437,7 @@ def feed():
         final_params = params + list(pagination_params)
         posts = query_db(query, final_params)
     elif sort == 'recommended':
-        posts = recommend(current_user_id, show == 'following' and current_user_id)
+        posts = recommend(current_user_id, show == 'following')
     else:  # Default sort is 'new'
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
@@ -479,6 +480,11 @@ def feed():
         # existing reaction/comment totals remain available separately.
         social_proof = get_post_social_proof(post['id'])
         post_dict = dict(post)
+        if current_user_id:
+            share_token = get_or_create_share_link(post['id'], current_user_id)
+            post_dict['share_url'] = url_for('shared_post', token=share_token, _external=True)
+        # Recommendation metadata is present only on the Recommended feed;
+        # normal feed modes continue using their existing post data.
         post_dict['content'], _ = moderate_content(post_dict['content'])
         comments_moderated = []
         for comment in comments_raw:
@@ -494,6 +500,7 @@ def feed():
             'social_proof': social_proof
         })
 
+    newcomer = bool(current_user_id and is_newcomer(current_user_id))
     #  4. Render Template with Pagination Info 
     return render_template('feed.html.j2', 
                            posts=posts_data, 
@@ -507,7 +514,16 @@ def feed():
                            community_norms=get_community_norm_statistics(),
                            post_draft=session.get('post_draft', ''),
                            min_post_length=MIN_POST_LENGTH,
-                           min_post_words=MIN_POST_WORDS)
+                           min_post_words=MIN_POST_WORDS,
+                           newcomer=newcomer,
+                           welcome_suggestions=(
+                               get_welcome_suggestions(current_user_id)
+                               if newcomer else []
+                           ),
+                           unread_welcome_count=(
+                               get_unread_welcome_count(current_user_id)
+                               if current_user_id else 0
+                           ))
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -665,7 +681,12 @@ def user_profile(username):
                            positive_contribution_score=(
                                get_positive_contribution_score(user['id'])
                                if current_user_id == user['id'] else None
-                           ))
+                           ),
+                           received_welcomes=(
+                               get_received_welcomes(user['id'])
+                               if current_user_id == user['id'] else []
+                           ),
+                           profile_is_newcomer=is_newcomer(user['id']))
     
 
 @app.route('/u/<username>/followers')
@@ -736,13 +757,19 @@ def post_detail(post_id):
         comment['content'] = moderated_comment_content
         comments.append(comment)
 
+    share_url = None
+    if session.get('user_id'):
+        share_token = get_or_create_share_link(post_id, session['user_id'])
+        share_url = url_for('shared_post', token=share_token, _external=True)
+
     # Pass the moderated data to the template
     return render_template('post_detail.html.j2',
                            post=post,
                            reactions=reactions,
                            comments=comments,
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           share_url=share_url)
 
 @app.route('/about')
 def about():
@@ -761,12 +788,14 @@ def signup():
         location = request.form.get('location', '')
         birthdate = request.form.get('birthdate', '')
         profile = request.form.get('profile', '')
+        referral_token = session.get('referral_token')
 
         hashed_password = generate_password_hash(password)
 
         db = get_db()
         cur = db.cursor()
         try:
+            initialize_social_connection_tables()
             cur.execute(
                 'INSERT INTO users (username, password, location, birthdate, profile) VALUES (?, ?, ?, ?, ?)',
                 (username, hashed_password, location, birthdate, profile)
@@ -780,6 +809,18 @@ def signup():
             session.clear() # Clear any old session data
             session['user_id'] = new_user_id
             session['username'] = username
+
+            if referral_token:
+                referral_link = query_db(
+                    'SELECT id FROM share_links WHERE token = ?',
+                    (referral_token,), one=True
+                )
+                if referral_link:
+                    db.execute('''
+                        INSERT OR IGNORE INTO referral_signups (share_link_id, new_user_id)
+                        VALUES (?, ?)
+                    ''', (referral_link['id'], new_user_id))
+                    db.commit()
 
             # 3. Flash a welcome message and redirect to the feed.
             flash(f'Welcome, {username}! Your account has been created.', 'success')
@@ -1376,6 +1417,265 @@ def moderate_content(content):
 
 # Coding Assignment #3
 # Assignment 3.1
+
+POSITIVE_REACTIONS = ('like', 'love', 'laugh', 'wow')
+RECOMMENDATION_FEEDBACK_TYPES = ('more_like_this', 'not_interested')
+RECOMMENDATION_STOP_WORDS = {
+    'about', 'after', 'again', 'also', 'because', 'being', 'could', 'from',
+    'have', 'into', 'just', 'more', 'most', 'other', 'that', 'their', 'there',
+    'these', 'they', 'this', 'those', 'through', 'very', 'what', 'when',
+    'where', 'which', 'with', 'would', 'your',
+}
+
+
+def initialize_social_connection_tables():
+    """Create additive sharing, referral, and welcome-message tables."""
+    db = get_db()
+    db.executescript('''
+        CREATE TABLE IF NOT EXISTS share_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT NOT NULL UNIQUE,
+            post_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS share_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_link_id INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            visitor_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS referral_signups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_link_id INTEGER NOT NULL,
+            new_user_id INTEGER NOT NULL UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS welcome_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER NOT NULL,
+            recipient_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            read_at TIMESTAMP
+        );
+    ''')
+    db.commit()
+
+
+def get_or_create_share_link(post_id, owner_id):
+    """Return a stable public token for a member's shared post."""
+    initialize_social_connection_tables()
+    existing = query_db(
+        'SELECT token FROM share_links WHERE post_id = ? AND owner_id = ?',
+        (post_id, owner_id), one=True
+    )
+    if existing:
+        return existing['token']
+    token = secrets.token_urlsafe(18)
+    db = get_db()
+    db.execute(
+        'INSERT INTO share_links (token, post_id, owner_id) VALUES (?, ?, ?)',
+        (token, post_id, owner_id)
+    )
+    db.commit()
+    return token
+
+
+def is_newcomer(user_id):
+    """Return whether a user joined within the newcomer welcome period."""
+    user = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user or not user['created_at']:
+        return False
+    created_at = _parse_database_datetime(user['created_at'])
+    return bool(created_at and (datetime.utcnow() - created_at).days < 7)
+
+
+def get_welcome_suggestions(user_id):
+    """Suggest recent members to welcome, excluding the current user."""
+    initialize_social_connection_tables()
+    return query_db('''
+        SELECT u.id, u.username
+        FROM users u
+        WHERE u.id != ?
+          AND u.created_at >= datetime('now', '-30 days')
+          AND NOT EXISTS (
+              SELECT 1 FROM welcome_messages w
+              WHERE w.sender_id = ? AND w.recipient_id = u.id
+          )
+        ORDER BY u.created_at DESC
+        LIMIT 5
+    ''', (user_id, user_id)) or []
+
+
+def get_unread_welcome_count(user_id):
+    initialize_social_connection_tables()
+    result = query_db(
+        'SELECT COUNT(*) AS count FROM welcome_messages WHERE recipient_id = ? AND read_at IS NULL',
+        (user_id,), one=True
+    )
+    return result['count'] if result else 0
+
+
+def get_received_welcomes(user_id):
+    """Return recent welcomes addressed to a member for profile display."""
+    initialize_social_connection_tables()
+    return query_db('''
+        SELECT w.id, w.message, w.created_at, w.read_at, u.username AS sender_username
+        FROM welcome_messages w
+        JOIN users u ON u.id = w.sender_id
+        WHERE w.recipient_id = ?
+        ORDER BY w.created_at DESC
+        LIMIT 10
+    ''', (user_id,)) or []
+
+
+@app.context_processor
+def social_connection_context():
+    """Expose unread welcome count to the shared navigation bar."""
+    user_id = session.get('user_id')
+    return {
+        'unread_welcome_count': get_unread_welcome_count(user_id) if user_id else 0
+    }
+
+
+@app.route('/share/<token>')
+def shared_post(token):
+    """Record a public share visit and redirect to the original post."""
+    initialize_social_connection_tables()
+    link = query_db('''
+        SELECT sl.id, sl.post_id, sl.owner_id
+        FROM share_links sl
+        WHERE sl.token = ?
+    ''', (token,), one=True)
+    if not link:
+        abort(404)
+
+    channel = request.args.get('channel', 'link')
+    if channel not in {'link', 'email', 'twitter', 'facebook', 'web'}:
+        channel = 'link'
+    db = get_db()
+    db.execute(
+        'INSERT INTO share_events (share_link_id, channel, visitor_id) VALUES (?, ?, ?)',
+        (link['id'], channel, session.get('user_id'))
+    )
+    db.commit()
+    if session.get('user_id') != link['owner_id']:
+        session['referral_token'] = token
+    return redirect(url_for('post_detail', post_id=link['post_id']))
+
+
+@app.route('/welcome/<int:user_id>', methods=['POST'])
+def send_welcome(user_id):
+    """Send a moderated, friendly welcome to a new member."""
+    sender_id = session.get('user_id')
+    if not sender_id:
+        flash('You must be logged in to welcome a member.', 'danger')
+        return redirect(url_for('login'))
+    if sender_id == user_id or not query_db('SELECT id FROM users WHERE id = ?', (user_id,), one=True):
+        flash('That member cannot receive this welcome.', 'warning')
+        return redirect(request.referrer or url_for('feed'))
+    if not is_newcomer(user_id):
+        flash('Welcome messages are available for recent members only.', 'warning')
+        return redirect(request.referrer or url_for('feed'))
+
+    message = request.form.get('message', '').strip()
+    if not message:
+        flash('Please write a short welcome message.', 'warning')
+        return redirect(request.referrer or url_for('feed'))
+    moderated_message, score = moderate_content(message)
+    if score >= 1.0:
+        flash('Please revise the welcome message so it follows the community rules.', 'warning')
+        return redirect(request.referrer or url_for('feed'))
+
+    initialize_social_connection_tables()
+    existing = query_db(
+        'SELECT id FROM welcome_messages WHERE sender_id = ? AND recipient_id = ?',
+        (sender_id, user_id), one=True
+    )
+    if existing:
+        flash('You have already welcomed this member.', 'info')
+        return redirect(request.referrer or url_for('feed'))
+    db = get_db()
+    db.execute(
+        'INSERT INTO welcome_messages (sender_id, recipient_id, message) VALUES (?, ?, ?)',
+        (sender_id, user_id, moderated_message)
+    )
+    db.commit()
+    flash('Your friendly welcome was sent.', 'success')
+    return redirect(request.referrer or url_for('feed'))
+
+
+@app.route('/welcome/<int:message_id>/read', methods=['POST'])
+def mark_welcome_read(message_id):
+    recipient_id = session.get('user_id')
+    if not recipient_id:
+        return redirect(url_for('login'))
+    initialize_social_connection_tables()
+    db = get_db()
+    db.execute(
+        '''UPDATE welcome_messages SET read_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND recipient_id = ?''',
+        (message_id, recipient_id)
+    )
+    db.commit()
+    return redirect(request.referrer or url_for('feed'))
+
+
+def initialize_recommendation_tables():
+    """Create recommendation feedback storage without changing existing tables."""
+    db = get_db()
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS recommendation_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            post_id INTEGER NOT NULL,
+            feedback_type TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            UNIQUE (user_id, post_id)
+        )
+    ''')
+    db.commit()
+
+
+def _recommendation_tokens(content):
+    """Extract useful words and hashtags for lightweight content matching."""
+    raw_tokens = re.findall(r'(?i)(#?[a-z][a-z0-9_]{2,})', content or '')
+    return [
+        token.lstrip('#').lower()
+        for token in raw_tokens
+        if token.lstrip('#').lower() not in RECOMMENDATION_STOP_WORDS
+    ]
+
+
+def _get_recommendation_feedback(user_id):
+    """Return the member's stored recommendation choices grouped by type."""
+    initialize_recommendation_tables()
+    rows = query_db(
+        'SELECT post_id, feedback_type FROM recommendation_feedback WHERE user_id = ?',
+        (user_id,)
+    ) or []
+    return {
+        feedback_type: {row['post_id'] for row in rows if row['feedback_type'] == feedback_type}
+        for feedback_type in RECOMMENDATION_FEEDBACK_TYPES
+    }
+
+
+def _recommendation_reason(overlap_terms, is_followed, liked_author, popularity):
+    """Explain the strongest reason a post was selected."""
+    if overlap_terms:
+        terms = ', '.join(f'#{term.upper()}' for term in overlap_terms[:3])
+        return f'Similar to posts you liked ({terms}).'
+    if is_followed:
+        return 'From a member you follow.'
+    if liked_author:
+        return 'From an author whose posts you liked.'
+    if popularity:
+        return 'Popular among community members.'
+    return 'A recent community post you may find interesting.'
+
+
 def recommend(user_id, filter_following):
     """
     Args:
@@ -1396,9 +1696,153 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    if not user_id:
+        return []
 
-    return recommended_posts;
+    feedback = _get_recommendation_feedback(user_id)
+    excluded_post_ids = feedback['more_like_this'] | feedback['not_interested']
+
+    positive_reactions = ','.join('?' for _ in POSITIVE_REACTIONS)
+    liked_posts = query_db(
+        f'''SELECT p.id, p.content, p.user_id
+            FROM posts p
+            JOIN reactions r ON r.post_id = p.id
+            WHERE r.user_id = ? AND r.reaction_type IN ({positive_reactions})''',
+        (user_id, *POSITIVE_REACTIONS)
+    ) or []
+    excluded_post_ids.update(post['id'] for post in liked_posts)
+
+    # Explicit "more like this" choices act as additional positive signals.
+    if feedback['more_like_this']:
+        placeholders = ','.join('?' for _ in feedback['more_like_this'])
+        liked_posts.extend(query_db(
+            f'''SELECT id, content, user_id FROM posts
+                WHERE id IN ({placeholders})''',
+            tuple(feedback['more_like_this'])
+        ) or [])
+
+    interest_weights = collections.Counter()
+    liked_authors = set()
+    for liked_post in liked_posts:
+        liked_authors.add(liked_post['user_id'])
+        for token in _recommendation_tokens(liked_post['content']):
+            # Hashtags are especially useful topic signals, so they receive
+            # extra weight when they appear in the liked content.
+            interest_weights[token] += 1
+
+    followed_users = {
+        row['followed_id'] for row in query_db(
+            'SELECT followed_id FROM follows WHERE follower_id = ?',
+            (user_id,)
+        ) or []
+    }
+
+    posts = query_db('''
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id,
+               COUNT(r.id) AS reaction_count
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN reactions r ON r.post_id = p.id
+        GROUP BY p.id, p.content, p.created_at, u.username, u.id
+    ''') or []
+
+    candidates = []
+    for post in posts:
+        post_id = post['id']
+        author_id = post['user_id']
+        if author_id == user_id or post_id in excluded_post_ids:
+            continue
+        if filter_following and author_id not in followed_users:
+            continue
+
+        candidate_tokens = set(_recommendation_tokens(post['content']))
+        overlap = [
+            token for token in candidate_tokens
+            if token in interest_weights
+        ]
+        similarity_score = sum(interest_weights[token] for token in overlap)
+        followed_bonus = 4 if author_id in followed_users else 0
+        liked_author_bonus = 2 if author_id in liked_authors else 0
+        popularity_bonus = min(int(post['reaction_count'] or 0), 3)
+
+        # A small relevance floor prevents unrelated posts from displacing
+        # useful matches when the member has already expressed interests.
+        if interest_weights and similarity_score == 0 and not followed_bonus and not popularity_bonus:
+            continue
+
+        total_score = (
+            similarity_score * 5
+            + followed_bonus
+            + liked_author_bonus
+            + popularity_bonus
+        )
+        candidates.append({
+            'post': dict(post),
+            'score': total_score,
+            'overlap': sorted(overlap, key=lambda token: interest_weights[token], reverse=True),
+            'is_followed': author_id in followed_users,
+            'liked_author': author_id in liked_authors,
+            'popularity': bool(popularity_bonus),
+        })
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate['score'],
+            candidate['post']['created_at'] or '',
+            candidate['post']['id'],
+        ),
+        reverse=True
+    )
+
+    recommendations = []
+    for candidate in candidates[:5]:
+        post = candidate['post']
+        post['recommendation_score'] = candidate['score']
+        post['recommendation_reason'] = _recommendation_reason(
+            candidate['overlap'],
+            candidate['is_followed'],
+            candidate['liked_author'],
+            candidate['popularity'],
+        )
+        recommendations.append(post)
+    return recommendations
+
+
+@app.route('/recommendations/feedback', methods=['POST'])
+def recommendation_feedback():
+    """Store a member's interactive recommendation preference."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to give recommendation feedback.', 'danger')
+        return redirect(url_for('login'))
+
+    post_id = request.form.get('post_id', type=int)
+    feedback_type = request.form.get('feedback_type')
+    if not post_id or feedback_type not in RECOMMENDATION_FEEDBACK_TYPES:
+        flash('Invalid recommendation feedback.', 'warning')
+        return redirect(request.referrer or url_for('feed', sort='recommended'))
+
+    if not query_db('SELECT id FROM posts WHERE id = ?', (post_id,), one=True):
+        flash('The recommended post no longer exists.', 'warning')
+        return redirect(request.referrer or url_for('feed', sort='recommended'))
+
+    initialize_recommendation_tables()
+    db = get_db()
+    db.execute('''
+        INSERT INTO recommendation_feedback (user_id, post_id, feedback_type)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, post_id) DO UPDATE SET
+            feedback_type = excluded.feedback_type,
+            created_at = CURRENT_TIMESTAMP
+    ''', (user_id, post_id, feedback_type))
+    db.commit()
+    message = (
+        'We will show more posts like this.'
+        if feedback_type == 'more_like_this'
+        else 'This post will be removed from your recommendations.'
+    )
+    flash(message, 'success')
+    return redirect(request.referrer or url_for('feed', sort='recommended'))
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

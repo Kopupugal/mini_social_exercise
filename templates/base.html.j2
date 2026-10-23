@@ -58,6 +58,7 @@
             <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="navbarUserDropdown">
               <!-- Link to user's profile page -->
               <li><a class="dropdown-item" href="{{ url_for('user_profile', username=session.get('username')) }}">My Profile</a></li>
+              <li><a class="dropdown-item" href="{{ url_for('feed') }}">Welcome messages{% if unread_welcome_count %} <span class="badge bg-success">{{ unread_welcome_count }}</span>{% endif %}</a></li>
               <li><hr class="dropdown-divider"></li>
               <li><a class="dropdown-item" href="/logout">Logout</a></li>
             </ul>

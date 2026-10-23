@@ -49,6 +49,39 @@
     </div>
   </div>
 
+  {% if session.get('user_id') and session.get('user_id') != user.id and profile_is_newcomer %}
+  <div class="card profile-goal-card mx-auto mt-4 shadow-sm border-success">
+    <div class="card-body">
+      <h3 class="card-title h5">Welcome @{{ user.username }}</h3>
+      <p class="small text-muted">This member recently joined the community.</p>
+      <form action="{{ url_for('send_welcome', user_id=user.id) }}" method="POST">
+        <div class="input-group">
+          <input class="form-control" name="message" maxlength="300" value="Welcome to the community, @{{ user.username }}!" required>
+          <button class="btn btn-success" type="submit">Send welcome</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if received_welcomes %}
+  <div class="card profile-goal-card mx-auto mt-4 shadow-sm">
+    <div class="card-body">
+      <h3 class="card-title h5">Welcome messages</h3>
+      {% for welcome in received_welcomes %}
+      <div class="border-bottom py-2 {% if not welcome.read_at %}fw-bold{% endif %}">
+        <div>@{{ welcome.sender_username }}: {{ welcome.message }}</div>
+        {% if not welcome.read_at %}
+        <form action="{{ url_for('mark_welcome_read', message_id=welcome.id) }}" method="POST" class="mt-1">
+          <button class="btn btn-sm btn-light" type="submit">Mark as read</button>
+        </form>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
   {# Claim 13 and Claim 15: show the member's goal, progress, deadline, and feedback. #}
   {% if weekly_goal %}
   <div class="card profile-goal-card mx-auto mt-4 shadow-sm">

@@ -25,6 +25,16 @@
       
       <p class="card-text mt-2">{{ post.content }}</p>
 
+      {% if share_url %}
+      <div class="share-controls small mb-2" aria-label="Share this post">
+        <strong>Share this post:</strong>
+        <a href="mailto:?subject=Mini Social post&body={{ share_url|urlencode }}" class="btn btn-sm btn-light">Email</a>
+        <a href="https://twitter.com/intent/tweet?url={{ share_url|urlencode }}" target="_blank" rel="noopener" class="btn btn-sm btn-light">X/Twitter</a>
+        <a href="https://www.facebook.com/sharer/sharer.php?u={{ share_url|urlencode }}" target="_blank" rel="noopener" class="btn btn-sm btn-light">Facebook</a>
+        <button type="button" class="btn btn-sm btn-light" onclick="navigator.clipboard.writeText('{{ share_url }}'); this.textContent='Copied!'">Copy link</button>
+      </div>
+      {% endif %}
+
       <!-- Reactions Display and Add Reaction Button (Copied from feed.html.j2) -->
       <div class="d-flex align-items-center mt-2 mb-2">
         <!-- Display existing reactions -->
